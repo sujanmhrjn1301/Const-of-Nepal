@@ -1,0 +1,25 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated vector indexes and embedding artifacts
+nepal_constitution_chroma/
+nepal_constitution_embeddings.npz
+nepal_constitution_embedding_metadata.json
+
+# Local logs and editor files
+*.log
+.vscode/
+.idea/
