@@ -25,6 +25,30 @@ def load_chunks(path: Path) -> List[Dict[str, Any]]:
     return data
 
 
+def retrieval_text(chunk: Dict[str, Any]) -> str:
+    metadata = chunk.get("metadata", {})
+    hierarchy: List[str] = []
+    if metadata.get("part_number") is not None:
+        hierarchy.append(
+            f"Part {metadata['part_number']}: {metadata.get('part_title') or ''}"
+        )
+    if metadata.get("article_number") is not None:
+        hierarchy.append(
+            f"Article {metadata['article_number']}: "
+            f"{metadata.get('article_title') or ''}"
+        )
+    if metadata.get("clause_number") is not None:
+        hierarchy.append(f"Clause {metadata['clause_number']}")
+    if metadata.get("subclause_number") is not None:
+        hierarchy.append(f"Subclause {metadata['subclause_number']}")
+    if metadata.get("schedule_number") is not None:
+        hierarchy.append(
+            f"Schedule {metadata['schedule_number']}: "
+            f"{metadata.get('schedule_title') or ''}"
+        )
+    return "\n".join([*hierarchy, str(chunk.get("text") or "")])
+
+
 def create_embeddings(
     input_path: Path,
     output_path: Path,
@@ -35,7 +59,7 @@ def create_embeddings(
     batch_size: int,
 ) -> None:
     chunks = load_chunks(input_path)
-    texts = [str(chunk.get("normalized_text") or chunk.get("text") or "") for chunk in chunks]
+    texts = [retrieval_text(chunk) for chunk in chunks]
     if not all(texts):
         raise ValueError("Every chunk must contain non-empty text.")
 
@@ -61,27 +85,34 @@ def create_embeddings(
         "embedding_dimension": int(embeddings.shape[1]),
         "chunk_count": len(chunks),
         "chunks": chunks,
+        "retrieval_texts": texts,
     }
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     chroma_client = chromadb.PersistentClient(path=str(chroma_path))
-    collection = chroma_client.get_or_create_collection(
+    try:
+        chroma_client.delete_collection(collection_name)
+    except Exception:
+        pass
+    collection = chroma_client.create_collection(
         name=collection_name,
-        metadata={"hnsw:space": "cosine"},
+        metadata={"hnsw:space": "cosine", "model_name": model_name},
     )
-    if collection.count():
-        collection.delete(ids=collection.get()["ids"])
     collection.add(
         ids=[str(chunk["chunk_id"]) for chunk in chunks],
         documents=[str(chunk.get("text") or "") for chunk in chunks],
         embeddings=embeddings.tolist(),
         metadatas=[
             {
+                "parent_chunk_id": str(chunk.get("parent_chunk_id") or ""),
                 "chunk_type": str(chunk.get("chunk_type", "")),
-                "page_start": int(chunk["metadata"].get("page_start") or 0),
-                "page_end": int(chunk["metadata"].get("page_end") or 0),
+                **{
+                    key: value
+                    for key, value in chunk.get("metadata", {}).items()
+                    if value is not None and key not in {"doc_id", "doc_title"}
+                },
             }
             for chunk in chunks
         ],

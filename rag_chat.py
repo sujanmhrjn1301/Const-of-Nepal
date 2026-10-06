@@ -12,12 +12,12 @@ from typing import Any, Dict, List
 import numpy as np
 import chromadb
 from dotenv import load_dotenv
+from create_embeddings import create_embeddings
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
 
-DEFAULT_EMBEDDINGS = "nepal_constitution_embeddings.npz"
-DEFAULT_METADATA = "nepal_constitution_embedding_metadata.json"
+DEFAULT_CHUNKS = "nepal_constitution_chunks.json"
 DEFAULT_MODEL = "all-MiniLM-L6-v2"
 DEFAULT_OPENROUTER_MODEL = "openai/gpt-4o-mini"
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -27,17 +27,30 @@ DEFAULT_CHROMA_PATH = "nepal_constitution_chroma"
 DEFAULT_COLLECTION = "constitution_chunks"
 
 
-def load_index(
-    embeddings_path: Path, metadata_path: Path
-) -> tuple[np.ndarray, List[Dict[str, Any]], str]:
-    with np.load(embeddings_path) as data:
-        embeddings = data["embeddings"].astype(np.float32)
-        stored_model = str(data["model_name"].item())
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    chunks = metadata.get("chunks")
-    if not isinstance(chunks, list) or len(chunks) != len(embeddings):
-        raise ValueError("Embedding vectors and chunk metadata do not have matching lengths.")
-    return embeddings, chunks, stored_model
+def load_index(collection: Any) -> tuple[List[Dict[str, Any]], str]:
+    data = collection.get(include=["documents", "metadatas"])
+    chunks = []
+    for chunk_id, document, metadata in zip(
+        data["ids"], data["documents"], data["metadatas"]
+    ):
+        chunk_metadata = dict(metadata)
+        parent_chunk_id = chunk_metadata.pop("parent_chunk_id", "")
+        if not parent_chunk_id:
+            parent_chunk_id = None
+        chunks.append(
+            {
+                "chunk_id": chunk_id,
+                "parent_chunk_id": parent_chunk_id,
+                "chunk_type": chunk_metadata.pop("chunk_type", ""),
+                "text": document,
+                "normalized_text": document,
+                "metadata": chunk_metadata,
+            }
+        )
+    model_name = collection.metadata.get("model_name") if collection.metadata else None
+    if not chunks or not isinstance(model_name, str) or not model_name:
+        raise ValueError("ChromaDB collection is missing chunks or model metadata.")
+    return chunks, model_name
 
 
 def tokenize(text: str) -> List[str]:
@@ -45,9 +58,57 @@ def tokenize(text: str) -> List[str]:
     return re.findall(r"\w+", text.casefold(), flags=re.UNICODE)
 
 
+def retrieval_text(chunk: Dict[str, Any]) -> str:
+    metadata = chunk.get("metadata", {})
+    hierarchy: List[str] = []
+    if metadata.get("part_number") is not None:
+        hierarchy.append(
+            f"Part {metadata['part_number']}: {metadata.get('part_title') or ''}"
+        )
+    if metadata.get("article_number") is not None:
+        hierarchy.append(
+            f"Article {metadata['article_number']}: "
+            f"{metadata.get('article_title') or ''}"
+        )
+    if metadata.get("clause_number") is not None:
+        hierarchy.append(f"Clause {metadata['clause_number']}")
+    if metadata.get("subclause_number") is not None:
+        hierarchy.append(f"Subclause {metadata['subclause_number']}")
+    if metadata.get("schedule_number") is not None:
+        hierarchy.append(
+            f"Schedule {metadata['schedule_number']}: "
+            f"{metadata.get('schedule_title') or ''}"
+        )
+    return "\n".join([*hierarchy, str(chunk.get("text") or "")])
+
+
+def hierarchy_header(chunk: Dict[str, Any]) -> str:
+    metadata = chunk.get("metadata", {})
+    labels: List[str] = []
+    if metadata.get("part_number") is not None:
+        labels.append(
+            f"Part {metadata['part_number']}: {metadata.get('part_title') or ''}"
+        )
+    if metadata.get("article_number") is not None:
+        labels.append(
+            f"Article {metadata['article_number']}: "
+            f"{metadata.get('article_title') or ''}"
+        )
+    if metadata.get("clause_number") is not None:
+        labels.append(f"Clause {metadata['clause_number']}")
+    if metadata.get("subclause_number") is not None:
+        labels.append(f"Subclause {metadata['subclause_number']}")
+    if metadata.get("schedule_number") is not None:
+        labels.append(
+            f"Schedule {metadata['schedule_number']}: "
+            f"{metadata.get('schedule_title') or ''}"
+        )
+    return " | ".join(labels)
+
+
 def build_bm25(chunks: List[Dict[str, Any]]) -> BM25Okapi:
     tokenized_chunks = [
-        tokenize(str(chunk.get("normalized_text") or chunk.get("text") or ""))
+        tokenize(retrieval_text(chunk))
         for chunk in chunks
     ]
     if not all(tokenized_chunks):
@@ -87,7 +148,6 @@ def retrieve(
     )
     dense_ids = dense_result["ids"][0]
     dense_documents = dense_result["documents"][0]
-    dense_metadatas = dense_result["metadatas"][0]
     dense_distances = np.asarray(dense_result["distances"][0], dtype=np.float32)
     dense_scores_by_id = {
         chunk_id: float(1.0 - distance)
@@ -135,9 +195,23 @@ def retrieve(
     return results
 
 
+def add_context(results: List[Dict[str, Any]], chunks: List[Dict[str, Any]]) -> None:
+    """Attach hierarchy and parent text without changing source text."""
+    chunk_by_id = {str(chunk["chunk_id"]): chunk for chunk in chunks}
+    for result in results:
+        result["_context_header"] = hierarchy_header(result)
+        parent = chunk_by_id.get(str(result.get("parent_chunk_id")))
+        if parent and parent.get("chunk_type") in {"article", "schedule"}:
+            result["_parent_text"] = str(parent.get("text") or "")
+        else:
+            result["_parent_text"] = ""
+
+
 def build_prompt(question: str, results: List[Dict[str, Any]]) -> str:
     context = "\n\n".join(
-        f"[Source {index}] {result['text']}\n"
+        f"[Source {index}] {result.get('_context_header', '')}\n"
+        f"Parent provision:\n{result.get('_parent_text', '')}\n"
+        f"Source text:\n{result['text']}\n"
         f"Chunk: {result['chunk_id']}; "
         f"Pages: {result['metadata'].get('page_start')}-"
         f"{result['metadata'].get('page_end')}"
@@ -145,9 +219,14 @@ def build_prompt(question: str, results: List[Dict[str, Any]]) -> str:
     )
     return (
         "You answer questions about the Constitution of Nepal using only the "
-        "provided source context. Do not invent or amend legal text. If the "
-        "context does not answer the question, say that it is not found in the "
-        "retrieved context. Include source chunk IDs and page numbers.\n\n"
+        "provided source context. Treat each source as a legal provision with "
+        "the displayed hierarchy. Do not infer a legal conclusion from a "
+        "generic shared word such as treatment, victim, authority, or service. "
+        "The subject matter of the cited provision must match the question. "
+        "If the context does not directly establish the answer, say so and "
+        "distinguish constitutional text from conclusions requiring other laws "
+        "or facts. Do not invent or amend legal text. Include source chunk IDs "
+        "and page numbers.\n\n"
         f"Question:\n{question}\n\nRetrieved context:\n{context}"
     )
 
@@ -190,8 +269,7 @@ def ask_openrouter(url: str, api_key: str, model_name: str, prompt: str) -> str:
 def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--embeddings", type=Path, default=Path(DEFAULT_EMBEDDINGS))
-    parser.add_argument("--metadata", type=Path, default=Path(DEFAULT_METADATA))
+    parser.add_argument("--chunks", type=Path, default=Path(DEFAULT_CHUNKS))
     parser.add_argument("--chroma-path", type=Path, default=Path(DEFAULT_CHROMA_PATH))
     parser.add_argument("--collection", default=DEFAULT_COLLECTION)
     parser.add_argument("--embedding-model", default=None)
@@ -219,12 +297,44 @@ def main() -> None:
     if not api_key:
         parser.error("OPENROUTER_API_KEY was not found in the environment or .env.")
 
-    embeddings, chunks, stored_model = load_index(args.embeddings, args.metadata)
+    chroma_client = chromadb.PersistentClient(path=str(args.chroma_path))
+    collection_names = {item.name for item in chroma_client.list_collections()}
+    expected_count = len(json.loads(args.chunks.read_text(encoding="utf-8")))
+    collection = (
+        chroma_client.get_collection(name=args.collection)
+        if args.collection in collection_names
+        else None
+    )
+    sample_metadata: Dict[str, Any] = {}
+    if collection is not None and collection.count():
+        sample = collection.get(limit=1, include=["metadatas"])
+        metadatas = sample.get("metadatas") or []
+        if metadatas:
+            sample_metadata = dict(metadatas[0] or {})
+    collection_ready = (
+        collection is not None
+        and collection.count() == expected_count
+        and isinstance(collection.metadata, dict)
+        and bool(collection.metadata.get("model_name"))
+        and "article_number" in sample_metadata
+    )
+    if not collection_ready:
+        print("ChromaDB is missing or incomplete; rebuilding the collection...")
+        create_embeddings(
+            args.chunks,
+            Path("nepal_constitution_embeddings.npz"),
+            Path("nepal_constitution_embedding_metadata.json"),
+            args.chroma_path,
+            args.collection,
+            args.embedding_model or DEFAULT_MODEL,
+            32,
+        )
+        collection = chroma_client.get_collection(name=args.collection)
+
+    chunks, stored_model = load_index(collection)
     model_name = args.embedding_model or stored_model
     model = SentenceTransformer(model_name)
     bm25 = build_bm25(chunks)
-    chroma_client = chromadb.PersistentClient(path=str(args.chroma_path))
-    collection = chroma_client.get_collection(name=args.collection)
     print("RAG chat ready. Type 'exit' or 'quit' to stop.")
 
     while True:
@@ -248,6 +358,7 @@ def main() -> None:
             args.dense_weight,
             args.bm25_weight,
         )
+        add_context(results, chunks)
         print("\nRetrieved sources:")
         for result in results:
             print(
