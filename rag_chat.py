@@ -134,31 +134,57 @@ def retrieve(
     dense_weight: float,
     bm25_weight: float,
 ) -> List[Dict[str, Any]]:
-    query_vector = model.encode(
-        [question],
+    query_variants = [
+        question,
+        (
+            "Relevant constitutional rights, duties, legal principles, "
+            f"articles, clauses, and related provisions concerning: {question}"
+        ),
+    ]
+    query_vectors = model.encode(
+        query_variants,
         convert_to_numpy=True,
         normalize_embeddings=True,
-    )[0].astype(np.float32)
-    bm25_scores = np.asarray(bm25.get_scores(tokenize(question)), dtype=np.float32)
+    ).astype(np.float32)
     candidate_count = min(len(chunks), max(100, top_k * 20))
-    dense_result = collection.query(
-        query_embeddings=[query_vector.tolist()],
-        n_results=candidate_count,
-        include=["documents", "metadatas", "distances"],
-    )
-    dense_ids = dense_result["ids"][0]
-    dense_documents = dense_result["documents"][0]
-    dense_distances = np.asarray(dense_result["distances"][0], dtype=np.float32)
-    dense_scores_by_id = {
-        chunk_id: float(1.0 - distance)
-        for chunk_id, distance in zip(dense_ids, dense_distances)
-    }
+    dense_scores_by_id: Dict[str, float] = {}
+    dense_documents_by_id: Dict[str, str] = {}
+    for query_vector in query_vectors:
+        dense_result = collection.query(
+            query_embeddings=[query_vector.tolist()],
+            n_results=candidate_count,
+            include=["documents", "distances"],
+        )
+        for chunk_id, document, distance in zip(
+            dense_result["ids"][0],
+            dense_result["documents"][0],
+            dense_result["distances"][0],
+        ):
+            score = float(1.0 - distance)
+            if score > dense_scores_by_id.get(chunk_id, float("-inf")):
+                dense_scores_by_id[chunk_id] = score
+                dense_documents_by_id[chunk_id] = document
+
+    bm25_scores_by_id: Dict[str, float] = {}
     chunk_by_id = {str(chunk["chunk_id"]): chunk for chunk in chunks}
-    candidate_ids = set(dense_ids)
+    candidate_ids = set(dense_scores_by_id)
+    for query in query_variants:
+        bm25_scores = np.asarray(
+            bm25.get_scores(tokenize(query)), dtype=np.float32
+        )
+        for index in np.argsort(bm25_scores)[::-1][:candidate_count]:
+            chunk_id = str(chunks[int(index)]["chunk_id"])
+            bm25_scores_by_id[chunk_id] = max(
+                bm25_scores_by_id.get(chunk_id, float("-inf")),
+                float(bm25_scores[int(index)]),
+            )
     bm25_candidate_count = min(len(chunks), max(100, top_k * 20))
     candidate_ids.update(
-        str(chunks[int(index)]["chunk_id"])
-        for index in np.argsort(bm25_scores)[::-1][:bm25_candidate_count]
+        sorted(
+            bm25_scores_by_id,
+            key=lambda chunk_id: bm25_scores_by_id[chunk_id],
+            reverse=True,
+        )[:bm25_candidate_count]
     )
     candidate_list = list(candidate_ids)
     dense_scores = np.asarray(
@@ -166,13 +192,7 @@ def retrieve(
         dtype=np.float32,
     )
     candidate_bm25_scores = np.asarray(
-        [
-            bm25_scores[next(
-                index for index, chunk in enumerate(chunks)
-                if str(chunk["chunk_id"]) == chunk_id
-            )]
-            for chunk_id in candidate_list
-        ],
+        [bm25_scores_by_id.get(chunk_id, 0.0) for chunk_id in candidate_list],
         dtype=np.float32,
     )
     total_weight = dense_weight + bm25_weight
@@ -185,9 +205,8 @@ def retrieve(
     for index in indices:
         chunk_id = candidate_list[int(index)]
         result = dict(chunk_by_id[chunk_id])
-        if chunk_id in dense_scores_by_id:
-            dense_index = dense_ids.index(chunk_id)
-            result["text"] = dense_documents[dense_index]
+        if chunk_id in dense_documents_by_id:
+            result["text"] = dense_documents_by_id[chunk_id]
         result["_hybrid_score"] = float(hybrid_scores[int(index)])
         result["_dense_score"] = float(dense_scores[int(index)])
         result["_bm25_score"] = float(candidate_bm25_scores[int(index)])
@@ -218,15 +237,25 @@ def build_prompt(question: str, results: List[Dict[str, Any]]) -> str:
         for index, result in enumerate(results, start=1)
     )
     return (
-        "You answer questions about the Constitution of Nepal using only the "
-        "provided source context. Treat each source as a legal provision with "
-        "the displayed hierarchy. Do not infer a legal conclusion from a "
-        "generic shared word such as treatment, victim, authority, or service. "
-        "The subject matter of the cited provision must match the question. "
-        "If the context does not directly establish the answer, say so and "
-        "distinguish constitutional text from conclusions requiring other laws "
-        "or facts. Do not invent or amend legal text. Include source chunk IDs "
-        "and page numbers.\n\n"
+        "You are a careful legal-information assistant for the Constitution "
+        "of Nepal. Use only the provided source context. Treat each source as "
+        "a legal provision with the displayed hierarchy. Do not infer a legal "
+        "conclusion from a generic shared word such as treatment, victim, "
+        "authority, or service. The subject matter of the cited provision "
+        "must match the question.\n\n"
+        "Respond in two sections:\n"
+        "1. Direct constitutional finding: state what the retrieved text "
+        "directly establishes. If the exact facts are not addressed, state "
+        "the broader constitutional principle and clearly say what cannot be "
+        "concluded.\n"
+        "2. Related constitutional provisions: list retrieved provisions that "
+        "are thematically or structurally relevant and explain why each is "
+        "relevant. Do not present related provisions as direct proof.\n\n"
+        "Never invent legal text, penalties, court outcomes, statutes, "
+        "regulations, or case law. Mention an external legal framework only "
+        "if it appears in the provided context. Distinguish constitutional "
+        "text from conclusions requiring other laws or facts. Include source "
+        "chunk IDs and page numbers.\n\n"
         f"Question:\n{question}\n\nRetrieved context:\n{context}"
     )
 
