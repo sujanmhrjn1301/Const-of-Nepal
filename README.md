@@ -81,10 +81,12 @@ Ask a question at the prompt and type `exit` or `quit` to stop.
 Example questions:
 
 ```text
-What is the right to communication?
-What does Article 96 provide?
-What is Schedule-1 about?
-I took my cousin to a government hospital after a road accident, but the staff delayed treatment asking for upfront payment first. Is this illegal under our constitution?
+- What is the right to communication?
+- What does Article 96 provide?
+- What is Schedule-1 about?
+- I took my cousin to a government hospital after a road accident, but
+the staff delayed treatment asking for upfront payment first. Is this
+illegal under our constitution?
 ```
 
 The retriever combines:
